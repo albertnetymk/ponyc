@@ -83,7 +83,7 @@ typedef void (*pony_serialise_fn)(pony_ctx_t* ctx, void* p, void* addr,
  * Each actor has a dispatch function that is invoked when the actor handles
  * a message.
  */
-typedef void (*pony_dispatch_fn)(pony_ctx_t* ctx, pony_actor_t* actor,
+typedef void (*pony_dispatch_fn)(pony_ctx_t** ctx, pony_actor_t* actor,
   pony_msg_t* m);
 
 /** Finalizer.

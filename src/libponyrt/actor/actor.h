@@ -33,7 +33,7 @@ typedef struct pony_actor_t
   gc_t gc; // 44/80 bytes
 } pony_actor_t;
 
-bool ponyint_actor_run(pony_ctx_t* ctx, pony_actor_t* actor, size_t batch);
+bool ponyint_actor_run(pony_ctx_t** ctx, pony_actor_t* actor, size_t batch);
 
 void ponyint_actor_destroy(pony_actor_t* actor);
 
@@ -54,6 +54,8 @@ void ponyint_actor_setsystem(pony_actor_t* actor);
 void ponyint_actor_setnoblock(bool state);
 
 PONY_API void ponyint_destroy(pony_actor_t* actor);
+
+bool pony_system_actor(pony_actor_t *actor);
 
 PONY_EXTERN_C_END
 

@@ -1,4 +1,6 @@
 #define PONY_WANT_ATOMIC_DEFS
+#define _XOPEN_SOURCE 800
+#include <ucontext.h>
 
 #include "scheduler.h"
 #include "cpu.h"
@@ -11,10 +13,17 @@
 #include <dtrace.h>
 #include <string.h>
 #include <stdio.h>
+#include <assert.h>
+#include <signal.h>
+#include "encore.h"
 
 #define SCHED_BATCH 100
 
 static DECLARE_THREAD_FN(run_thread);
+
+extern void unset_unscheduled(pony_actor_t* a);
+extern bool is_unscheduled(pony_actor_t*);
+extern bool pony_reschedule(pony_actor_t *actor);
 
 typedef enum
 {
@@ -27,6 +36,8 @@ typedef enum
 
 // Scheduler global data.
 static uint32_t scheduler_count;
+static uint32_t context_waiting = 0;
+static uint32_t thread_exit = 0;
 static scheduler_t* scheduler;
 static PONY_ATOMIC(bool) detect_quiescence;
 static bool use_yield;
@@ -269,6 +280,7 @@ static void run(scheduler_t* sched)
 
   while(true)
   {
+    assert(sched == this_scheduler);
     if(actor == NULL)
     {
       // We had an empty queue and no rescheduled actor.
@@ -284,11 +296,19 @@ static void run(scheduler_t* sched)
     }
 
     // Run the current actor and get the next actor.
-    bool reschedule = ponyint_actor_run(&sched->ctx, actor, SCHED_BATCH);
+    pony_ctx_t *ctx = &sched->ctx;
+    bool reschedule = ponyint_actor_run(&ctx, actor, SCHED_BATCH);
+#ifdef LAZY_IMPL
+    sched = this_scheduler;
+#endif
+
     pony_actor_t* next = pop_global(sched);
 
     if(reschedule)
     {
+#ifndef LAZY_IMPL
+      actor_unlock((encore_actor_t*)actor);
+#endif
       if(next != NULL)
       {
         // If we have a next actor, we go on the back of the queue. Otherwise,
@@ -304,6 +324,7 @@ static void run(scheduler_t* sched)
 
         if(next == NULL)
         {
+          assert(pop_global(sched) == NULL);
           // Termination.
           DTRACE2(ACTOR_DESCHEDULED, (uintptr_t)sched, (uintptr_t)actor);
           return;
@@ -319,6 +340,9 @@ static void run(scheduler_t* sched)
         }
       }
     } else {
+#ifndef LAZY_IMPL
+      actor_unlock((encore_actor_t*)actor);
+#endif
       // We aren't rescheduling, so run the next actor. This may be NULL if our
       // queue was empty.
       DTRACE2(ACTOR_DESCHEDULED, (uintptr_t)sched, (uintptr_t)actor);
@@ -330,15 +354,75 @@ static void run(scheduler_t* sched)
   }
 }
 
-static DECLARE_THREAD_FN(run_thread)
+static __pony_thread_local ucontext_t *origin;
+
+static void jump_buffer()
+{
+  __atomic_fetch_add(&thread_exit, 1, __ATOMIC_RELAXED);
+  while(__atomic_load_n(&thread_exit, __ATOMIC_RELAXED) < scheduler_count) ;
+}
+
+static void __attribute__ ((noreturn)) jump_origin()
+{
+  static __pony_thread_local char stack[MINSIGSTKSZ];
+  static __pony_thread_local ucontext_t ctx;
+  getcontext(&ctx);
+  ctx.uc_stack.ss_sp = stack;
+  ctx.uc_stack.ss_size = MINSIGSTKSZ;
+  ctx.uc_link = origin;
+  makecontext(&ctx, (void(*)(void))&jump_buffer, 0);
+  setcontext(&ctx);
+  assert(0);
+  exit(-1);
+}
+
+__attribute__ ((noreturn))
+void public_run(pony_actor_t *actor)
+{
+  assert(this_scheduler);
+  if (pony_reschedule(actor)) {
+    push(this_scheduler, actor);
+  }
+  actor_unlock((encore_actor_t *)actor);
+  run(this_scheduler);
+
+  __atomic_fetch_add(&context_waiting, 1, __ATOMIC_RELAXED);
+  while(__atomic_load_n(&context_waiting, __ATOMIC_RELAXED) < scheduler_count) ;
+
+  jump_origin();
+}
+
+static void *run_thread(void *arg)
 {
   scheduler_t* sched = (scheduler_t*) arg;
   this_scheduler = sched;
   ponyint_cpu_affinity(sched->cpu);
-  run(sched);
-  ponyint_pool_thread_cleanup();
 
-  return 0;
+#ifdef LAZY_IMPL
+  context uctx;
+  root_context = this_context = &uctx;
+  ucontext_t ucontext;
+  origin = &ucontext;
+
+  getcontext(origin);
+  if (__atomic_load_n(&context_waiting, __ATOMIC_RELAXED) == scheduler_count) {
+    ponyint_pool_thread_cleanup();
+    return NULL;
+  }
+#endif
+  /* pony_ctx_t *ctx = &sched->ctx; */
+
+  run(sched);
+
+#ifdef LAZY_IMPL
+  __atomic_fetch_add(&context_waiting, 1, __ATOMIC_RELAXED);
+  while(__atomic_load_n(&context_waiting, __ATOMIC_RELAXED) < scheduler_count) ;
+
+  jump_origin();
+#endif
+
+  ponyint_pool_thread_cleanup();
+  return NULL;
 }
 
 static void ponyint_sched_shutdown()
@@ -347,10 +431,16 @@ static void ponyint_sched_shutdown()
 
   start = 0;
 
-  for(uint32_t i = start; i < scheduler_count; i++)
+  for(uint32_t i = start; i < scheduler_count; i++) {
     ponyint_thread_join(scheduler[i].tid);
+    assert(pop_global(&scheduler[i]) == NULL);
+  }
+  assert(pop_global(&scheduler[0]) == NULL);
 
   DTRACE0(RT_END);
+
+  // back to main thread, but uses ctx from schedule[0]
+  this_scheduler = &scheduler[0];
   ponyint_cycle_terminate(&scheduler[0].ctx);
 
   for(uint32_t i = 0; i < scheduler_count; i++)

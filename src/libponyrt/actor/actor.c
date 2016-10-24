@@ -9,7 +9,9 @@
 #include "ponyassert.h"
 #include <string.h>
 #include <stdio.h>
+#include <assert.h>
 #include <dtrace.h>
+#include "encore.h"
 
 #ifdef USE_VALGRIND
 #include <valgrind/helgrind.h>
@@ -23,6 +25,8 @@ enum
   FLAG_UNSCHEDULED = 1 << 3,
   FLAG_PENDINGDESTROY = 1 << 4,
 };
+
+extern bool gc_disabled(pony_ctx_t *ctx);
 
 static bool actor_noblock = false;
 
@@ -41,9 +45,15 @@ static void unset_flag(pony_actor_t* actor, uint8_t flag)
   actor->flags &= (uint8_t)~flag;
 }
 
-static bool handle_message(pony_ctx_t* ctx, pony_actor_t* actor,
+static bool handle_message(pony_ctx_t** ctx, pony_actor_t* actor,
   pony_msg_t* msg)
 {
+  if (!has_flag(actor, FLAG_SYSTEM)) {
+    if (encore_actor_handle_message_hook((encore_actor_t*)actor, msg)) {
+      return true;
+    }
+  }
+
   switch(msg->id)
   {
     case ACTORMSG_ACQUIRE:
@@ -83,7 +93,7 @@ static bool handle_message(pony_ctx_t* ctx, pony_actor_t* actor,
         // We're blocked and our RC hasn't changed since our last block
         // message, send confirm.
         pony_msgi_t* m = (pony_msgi_t*)msg;
-        ponyint_cycle_ack(ctx, m->i);
+        ponyint_cycle_ack(*ctx, m->i);
       }
 
       return false;
@@ -96,11 +106,29 @@ static bool handle_message(pony_ctx_t* ctx, pony_actor_t* actor,
         // Send unblock before continuing. We no longer need to send any
         // pending rc change to the cycle detector.
         unset_flag(actor, FLAG_BLOCKED | FLAG_RC_CHANGED);
-        ponyint_cycle_unblock(ctx, actor);
+        ponyint_cycle_unblock(*ctx, actor);
       }
 
-      DTRACE3(ACTOR_MSG_RUN, (uintptr_t)ctx->scheduler, (uintptr_t)actor, msg->id);
-      actor->type->dispatch(ctx, actor, msg);
+      DTRACE3(ACTOR_MSG_RUN, (uintptr_t)(*ctx)->scheduler, (uintptr_t)actor, msg->id);
+      if (!has_flag(actor, FLAG_SYSTEM)) {
+#ifndef LAZY_IMPL
+        encore_actor_t *a = (encore_actor_t *)actor;
+        getcontext(&a->uctx);
+        a->uctx.uc_stack.ss_sp = get_local_page_stack();
+        a->uctx.uc_stack.ss_size = Stack_Size;
+        a->uctx.uc_link = &a->home_uctx;
+        a->uctx.uc_stack.ss_flags = 0;
+        makecontext(&a->uctx,
+            (void(*)(void))actor->type->dispatch, 3, ctx, a, msg);
+        int ret = swapcontext(&a->home_uctx, &a->uctx);
+        assert(ret == 0);
+        return !has_flag(actor, FLAG_UNSCHEDULED);
+#else
+        actor->type->dispatch(ctx, actor, msg);
+#endif
+      } else {
+        actor->type->dispatch((void*)*ctx, actor, msg);
+      }
       return true;
     }
   }
@@ -108,6 +136,10 @@ static bool handle_message(pony_ctx_t* ctx, pony_actor_t* actor,
 
 static void try_gc(pony_ctx_t* ctx, pony_actor_t* actor)
 {
+  if (gc_disabled(ctx)) {
+    return;
+  }
+
   if(!ponyint_heap_startgc(&actor->heap))
     return;
 
@@ -124,12 +156,25 @@ static void try_gc(pony_ctx_t* ctx, pony_actor_t* actor)
   DTRACE1(GC_END, (uintptr_t)ctx->scheduler);
 }
 
-bool ponyint_actor_run(pony_ctx_t* ctx, pony_actor_t* actor, size_t batch)
+bool ponyint_actor_run(pony_ctx_t** ctx, pony_actor_t* actor, size_t batch)
 {
-  ctx->current = actor;
+  (*ctx)->current = actor;
+  size_t app = 0;
+
+  if (!has_flag(actor, FLAG_SYSTEM)) {
+    if (encore_actor_run_hook((encore_actor_t *)actor)) {
+      if (has_flag((pony_actor_t *)actor, FLAG_UNSCHEDULED)) {
+        return false;
+      }
+      app++;
+      try_gc(*ctx, actor);
+      if (app == batch) {
+        return true;
+      }
+    }
+  }
 
   pony_msg_t* msg;
-  size_t app = 0;
 
   while(actor->continuation != NULL)
   {
@@ -143,7 +188,7 @@ bool ponyint_actor_run(pony_ctx_t* ctx, pony_actor_t* actor, size_t batch)
     {
       // If we handle an application message, try to gc.
       app++;
-      try_gc(ctx, actor);
+      try_gc(*ctx, actor);
 
       if(app == batch)
         return !has_flag(actor, FLAG_UNSCHEDULED);
@@ -152,14 +197,13 @@ bool ponyint_actor_run(pony_ctx_t* ctx, pony_actor_t* actor, size_t batch)
 
   // If we have been scheduled, the head will not be marked as empty.
   pony_msg_t* head = atomic_load_explicit(&actor->q.head, memory_order_relaxed);
-
   while((msg = ponyint_messageq_pop(&actor->q)) != NULL)
   {
     if(handle_message(ctx, actor, msg))
     {
       // If we handle an application message, try to gc.
       app++;
-      try_gc(ctx, actor);
+      try_gc(*ctx, actor);
 
       if(app == batch)
         return !has_flag(actor, FLAG_UNSCHEDULED);
@@ -171,10 +215,11 @@ bool ponyint_actor_run(pony_ctx_t* ctx, pony_actor_t* actor, size_t batch)
       break;
   }
 
+  assert((*ctx)->current == actor);
   // We didn't hit our app message batch limit. We now believe our queue to be
   // empty, but we may have received further messages.
   pony_assert(app < batch);
-  try_gc(ctx, actor);
+  try_gc(*ctx, actor);
 
   if(has_flag(actor, FLAG_UNSCHEDULED))
   {
@@ -195,7 +240,7 @@ bool ponyint_actor_run(pony_ctx_t* ctx, pony_actor_t* actor, size_t batch)
   {
     set_flag(actor, FLAG_BLOCKED);
     unset_flag(actor, FLAG_RC_CHANGED);
-    ponyint_cycle_block(ctx, actor, &actor->gc);
+    ponyint_cycle_block(*ctx, actor, &actor->gc);
   }
 
   // Return true (i.e. reschedule immediately) if our queue isn't empty.
@@ -227,6 +272,14 @@ void ponyint_actor_destroy(pony_actor_t* actor)
 
   // Free variable sized actors correctly.
   ponyint_pool_free_size(actor->type->size, actor);
+}
+
+bool is_unscheduled(pony_actor_t* a){
+  return has_flag(a, FLAG_UNSCHEDULED);
+}
+
+void unset_unscheduled(pony_actor_t* runner){
+  unset_flag(runner, FLAG_UNSCHEDULED);
 }
 
 gc_t* ponyint_actor_gc(pony_actor_t* actor)
@@ -460,8 +513,24 @@ PONY_API void pony_become(pony_ctx_t* ctx, pony_actor_t* actor)
   ctx->current = actor;
 }
 
-PONY_API void pony_poll(pony_ctx_t* ctx)
+bool pony_system_actor(pony_actor_t *actor)
 {
-  pony_assert(ctx->current != NULL);
-  ponyint_actor_run(ctx, ctx->current, 1);
+  return has_flag(actor, FLAG_SYSTEM);
 }
+
+bool pony_reschedule(pony_actor_t *actor)
+{
+  return !has_flag(actor, FLAG_UNSCHEDULED);
+}
+
+// NOTE: (Kiko) The function `pony_poll` is not used by Encore and/or the
+// PonyRT. This means that it is used by the Pony compiler. In the Encore
+// context, if we allow this function, we would need to pass a `pony_ctx_t**`
+// as argument, since the `actor_run` requires a `pony_ctx_t**`. The reason for
+// this is that the `actor_run` updates the `ctx` argument to point to a new
+// context and this can only be done with a pointer to a pointer.
+// void pony_poll(pony_ctx_t* ctx)
+// {
+//   assert(ctx->current != NULL);
+//   ponyint_actor_run(ctx, ctx->current, 1);
+// }

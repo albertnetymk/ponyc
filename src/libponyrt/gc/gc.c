@@ -561,6 +561,85 @@ void ponyint_gc_markactor(pony_ctx_t* ctx, pony_actor_t* actor)
   mark_remote_actor(ctx, gc, aref);
 }
 
+void encore_future_gc_acquireactor(pony_ctx_t* ctx, pony_actor_t* actor)
+{
+  gc_t* gc = ponyint_actor_gc(ctx->current);
+
+  if (actor == ctx->current) {
+    return;
+  }
+
+  actorref_t* aref = ponyint_actormap_getorput(&gc->foreign, actor, gc->mark);
+  actorref_t* aquire_aref = ponyint_actormap_getorput(&ctx->acquire, actor, 0);
+  if (aref->mark != gc->mark) {
+    aref->mark = gc->mark;
+    aref->rc++;
+    gc->delta = ponyint_deltamap_update(gc->delta, aref->actor, aref->rc);
+    aquire_aref->rc++;
+  }
+}
+
+void encore_future_gc_acquireobject(pony_ctx_t* ctx, void* p, pony_type_t *t,
+    int mutability)
+{
+  chunk_t* chunk = (chunk_t*)ponyint_pagemap_get(p);
+
+  // Don't gc memory that wasn't pony_allocated, but do recurse.
+  if(chunk == NULL) {
+    if(mutability != PONY_TRACE_OPAQUE) {
+      recurse(ctx, p, t->trace);
+    }
+    return;
+  }
+
+  pony_actor_t* actor = ponyint_heap_owner(chunk);
+  gc_t* gc = ponyint_actor_gc(ctx->current);
+
+  if (actor == ctx->current) {
+    return;
+  }
+
+  actorref_t* aref = ponyint_actormap_getorput(&gc->foreign, actor, gc->mark);
+  actorref_t* aquire_aref = ponyint_actormap_getorput(&ctx->acquire, actor, 0);
+  if (aref->mark != gc->mark) {
+    aref->mark = gc->mark;
+    aref->rc++;
+    gc->delta = ponyint_deltamap_update(gc->delta, aref->actor, aref->rc);
+    aquire_aref->rc++;
+  }
+
+  object_t* obj = ponyint_actorref_getorput(aref, p, gc->mark);
+  object_t* aquire_obj = ponyint_actorref_getorput(aquire_aref, p, 0);
+  if(obj->mark != gc->mark) {
+    if(obj->rc == 0)
+    {
+      // Increase apparent used memory to provoke GC.
+      ponyint_heap_used(ponyint_actor_heap(ctx->current),
+        ponyint_heap_size(chunk));
+
+      // Increase apparent used memory further if the object is immutable, to
+      // account for memory that is reachable but not traced by this actor.
+      if(mutability == PONY_TRACE_IMMUTABLE) {
+        ponyint_heap_used(ponyint_actor_heap(ctx->current),
+            GC_IMMUT_HEAP_EQUIV);
+      }
+    }
+
+    obj->rc++;
+    obj->mark = gc->mark;
+    aquire_obj->rc++;
+
+    if(mutability == PONY_TRACE_OPAQUE)
+      return;
+
+    if(mutability == PONY_TRACE_IMMUTABLE)
+      obj->immutable = true;
+
+    if(!obj->immutable)
+      recurse(ctx, p, t->trace);
+  }
+}
+
 void ponyint_gc_acquireactor(pony_ctx_t* ctx, pony_actor_t* actor)
 {
   if(actor == ctx->current)

@@ -5,7 +5,7 @@ provider pony {
   probe actor__alloc(uintptr_t scheduler);
 
   /**
-   * Fired when a message is being send
+   * Fired when a message is being sent
    * @param id the message id
    */
   probe actor__msg__send(uintptr_t scheduler, uint32_t id);
@@ -95,7 +95,7 @@ provider pony {
   probe rt__end();
 
   /**
-   * Fired when a scheduler successfully steals a job
+   * Fired when a scheduler succesfully steals a job
    * @param scheduler is the scheduler that stole the job
    * @param victim is the victim that the scheduler stole from
    * @param actor is actor that was stolen from the victim

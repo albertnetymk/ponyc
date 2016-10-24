@@ -49,12 +49,12 @@ void ponyint_assert_fail(const char* expr, const char* file, size_t line,
 
   free(strings);
 
-  if(strcmp(PONY_BUILD_CONFIG, "release") == 0)
-  {
-    fputs("This is an optimised version of ponyc: the backtrace may be "
-      "imprecise or incorrect.\nUse a debug version to get more meaningful "
-      "information.\n", stderr);
-  }
+  // if(strcmp(PONY_BUILD_CONFIG, "release") == 0)
+  // {
+  //   fputs("This is an optimised version of ponyc: the backtrace may be "
+  //     "imprecise or incorrect.\nUse a debug version to get more meaningful "
+  //     "information.\n", stderr);
+  // }
 
   fflush(stderr);
   abort();
