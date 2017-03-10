@@ -391,7 +391,7 @@ libponyc.tests.buildoptions += -D__STDC_FORMAT_MACROS
 libponyc.tests.buildoptions += -D__STDC_LIMIT_MACROS
 libponyc.tests.buildoptions += -DPONY_PACKAGES_DIR=\"$(packages_abs_src)\"
 
-libponyc.tests.linkoptions += -rdynamic
+libponyc.tests.linkoptions += -rdynamic -ldl
 
 libponyc.benchmarks.buildoptions = -D__STDC_CONSTANT_MACROS
 libponyc.benchmarks.buildoptions += -D__STDC_FORMAT_MACROS

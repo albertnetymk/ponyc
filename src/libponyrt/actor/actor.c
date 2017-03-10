@@ -99,6 +99,11 @@ static bool handle_message(pony_ctx_t* ctx, pony_actor_t* actor,
         ponyint_cycle_unblock(ctx, actor);
       }
 
+      volatile void *stack_top_marker;
+      // if (!scheduler_stack_top) {
+      scheduler_stack_top = (void*) &stack_top_marker;
+      // }
+
       DTRACE3(ACTOR_MSG_RUN, (uintptr_t)ctx->scheduler, (uintptr_t)actor, msg->id);
       actor->type->dispatch(ctx, actor, msg);
       return true;
@@ -114,6 +119,51 @@ static void try_gc(pony_ctx_t* ctx, pony_actor_t* actor)
   DTRACE1(GC_START, (uintptr_t)ctx->scheduler);
 
   ponyint_gc_mark(ctx);
+
+  if(actor->type->trace != NULL)
+    actor->type->trace(ctx, actor);
+
+  ponyint_mark_done(ctx);
+  ponyint_heap_endgc(&actor->heap);
+
+  DTRACE1(GC_END, (uintptr_t)ctx->scheduler);
+}
+
+static bool looks_like_pointer(void *p)
+{
+  if (p > (void*)0xffffffffffff) {
+    return false;
+  }
+  return true;
+}
+
+void* ponyint_pagemap_get(const void* m);
+static void try_stack_gc(pony_ctx_t* ctx, pony_actor_t* actor)
+{
+  if (!scheduler_stack_top) {
+    return;
+  }
+  if(!ponyint_heap_startgc(&actor->heap))
+    return;
+
+  DTRACE1(GC_START, (uintptr_t)ctx->scheduler);
+
+  volatile void *stack_bottom_marker;
+  pony_assert(scheduler_stack_top);
+  void **index = (void*) &stack_bottom_marker+1;
+  void *cur;
+  ponyint_gc_mark(ctx);
+
+  // stack scanning
+  while (index < scheduler_stack_top) {
+    cur = *index;
+    printf("inspect %p, %p, %p\n", index, cur, ponyint_pagemap_get(cur));
+    if (looks_like_pointer(cur) && ponyint_pagemap_get(cur)) {
+      printf("trace %p\n", cur);
+      pony_traceunknown(ctx, cur, PONY_TRACE_MUTABLE);
+    }
+    index++;
+  }
 
   if(actor->type->trace != NULL)
     actor->type->trace(ctx, actor);
@@ -381,6 +431,8 @@ PONY_API void pony_continuation(pony_actor_t* self, pony_msg_t* m)
 PONY_API void* pony_alloc(pony_ctx_t* ctx, size_t size)
 {
   DTRACE2(HEAP_ALLOC, (uintptr_t)ctx->scheduler, size);
+
+  try_stack_gc(ctx, ctx->current);
 
   return ponyint_heap_alloc(ctx->current, &ctx->current->heap, size);
 }

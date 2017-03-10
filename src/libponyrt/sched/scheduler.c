@@ -33,6 +33,8 @@ static bool use_yield;
 static mpmcq_t inject;
 static __pony_thread_local scheduler_t* this_scheduler;
 
+__pony_thread_local void** scheduler_stack_top;
+
 /**
  * Gets the next actor from the scheduler queue.
  */
@@ -377,6 +379,8 @@ pony_ctx_t* ponyint_sched_init(uint32_t threads, bool noyield, bool nopin,
     threads = ponyint_cpu_count();
 
   scheduler_count = threads;
+  scheduler_count = 1;
+  // scheduler_count = 1;
   scheduler = (scheduler_t*)ponyint_pool_alloc_size(
     scheduler_count * sizeof(scheduler_t));
   memset(scheduler, 0, scheduler_count * sizeof(scheduler_t));

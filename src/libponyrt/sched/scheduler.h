@@ -20,6 +20,8 @@ typedef void (*trace_actor_fn)(pony_ctx_t* ctx, pony_actor_t* actor);
 
 typedef struct scheduler_t scheduler_t;
 
+extern __pony_thread_local void** scheduler_stack_top;
+
 typedef struct pony_ctx_t
 {
   scheduler_t* scheduler;
