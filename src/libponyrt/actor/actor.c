@@ -129,12 +129,34 @@ static void try_gc(pony_ctx_t* ctx, pony_actor_t* actor)
   DTRACE1(GC_END, (uintptr_t)ctx->scheduler);
 }
 
-static bool looks_like_pointer(void *p)
+extern void* ponyint_pagemap_get(const void* m);
+
+extern actorref_t* ponyint_actormap_getactor(
+    actormap_t* map, pony_actor_t* actor, size_t* index);
+
+bool looks_like_pointer(pony_ctx_t *ctx, void *p)
 {
-  if (p > (void*)0xffffffffffff) {
+  chunk_t* chunk = (chunk_t *)ponyint_pagemap_get(p);
+
+  return chunk;
+  if (chunk) {
+    printf("chunk is %p\n", chunk);
+    pony_actor_t* owner = ponyint_heap_owner(chunk);
+    /// p is owned by current actor
+    if (owner == ctx->current) return true;
+
+    gc_t* gc = ponyint_actor_gc(ctx->current);
+    size_t index = HASHMAP_UNKNOWN;
+    actorref_t* aref = ponyint_actormap_getactor(&gc->foreign, owner, &index);
+    /// if aref == NULL, then there is no foreign ref count for owner
+    /// if ponyint_actorref_getobject() == NULL, there is no foreign
+    /// reference count for p
+    /// In both cases -- then p not in foreign reference table, so cannot be valid ref
+    return aref || ponyint_actorref_getobject(aref, p);
+  } else {
+    /// p not allocated on a Pony heap
     return false;
   }
-  return true;
 }
 
 void* ponyint_pagemap_get(const void* m);
@@ -157,8 +179,8 @@ static void try_stack_gc(pony_ctx_t* ctx, pony_actor_t* actor)
   // stack scanning
   while (index < scheduler_stack_top) {
     cur = *index;
-    printf("inspect %p, %p, %p\n", index, cur, ponyint_pagemap_get(cur));
-    if (looks_like_pointer(cur) && ponyint_pagemap_get(cur)) {
+    // printf("inspect %p, %p, %d\n", index, cur, looks_like_pointer(ctx, cur));
+    if (looks_like_pointer(ctx, cur)) {
       printf("trace %p\n", cur);
       pony_traceunknown(ctx, cur, PONY_TRACE_MUTABLE);
     }
